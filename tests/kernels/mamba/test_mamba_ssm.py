@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import os
+import tempfile
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -1095,3 +1099,88 @@ def test_selective_state_update_varlen_with_num_accepted(
             state_ref = state_ref_intermediate[(seq_idx, token_idx)].squeeze(0)
 
             assert torch.allclose(state[dst_slot], state_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_get_mamba_ssm_configs_fallback():
+    """When no config file exists, should return None (use defaults)."""
+    from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
+        get_mamba_ssm_configs,
+    )
+
+    get_mamba_ssm_configs.cache_clear()
+    result = get_mamba_ssm_configs(dim=99999, dstate=99999)
+    assert result is None
+    get_mamba_ssm_configs.cache_clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_get_mamba_ssm_configs_loads_json(monkeypatch):
+    """When a config file exists in VLLM_TUNED_CONFIG_FOLDER, load it."""
+    from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
+        get_mamba_config_file_name,
+        get_mamba_ssm_configs,
+    )
+
+    get_mamba_ssm_configs.cache_clear()
+
+    config_data = {
+        "1": {"BLOCK_SIZE_M": 16, "num_warps": 4},
+        "4": {"BLOCK_SIZE_M": 32, "num_warps": 8},
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = get_mamba_config_file_name(dim=64, dstate=128)
+        config_path = os.path.join(tmpdir, fname)
+        with open(config_path, "w") as f:
+            json.dump(config_data, f)
+
+        monkeypatch.setattr("vllm.envs.VLLM_TUNED_CONFIG_FOLDER", tmpdir)
+        result = get_mamba_ssm_configs(dim=64, dstate=128)
+        assert result is not None
+        assert result[1]["BLOCK_SIZE_M"] == 16
+        assert result[1]["num_warps"] == 4
+        assert result[4]["BLOCK_SIZE_M"] == 32
+        assert result[4]["num_warps"] == 8
+
+    get_mamba_ssm_configs.cache_clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_get_mamba_ssm_configs_closest_batch_size(monkeypatch):
+    """Verify closest batch size lookup works correctly."""
+    from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
+        get_mamba_config_file_name,
+        get_mamba_ssm_configs,
+    )
+
+    get_mamba_ssm_configs.cache_clear()
+
+    config_data = {
+        "1": {"BLOCK_SIZE_M": 4, "num_warps": 8},
+        "16": {"BLOCK_SIZE_M": 16, "num_warps": 4},
+        "64": {"BLOCK_SIZE_M": 32, "num_warps": 4},
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = get_mamba_config_file_name(dim=77, dstate=77)
+        config_path = os.path.join(tmpdir, fname)
+        with open(config_path, "w") as f:
+            json.dump(config_data, f)
+
+        monkeypatch.setattr("vllm.envs.VLLM_TUNED_CONFIG_FOLDER", tmpdir)
+        result = get_mamba_ssm_configs(dim=77, dstate=77)
+        assert result is not None
+
+        # N=10 should pick closest key=16 (distance 6) vs key=1 (distance 9)
+        closest = min(result.keys(), key=lambda x: abs(x - 10))
+        assert closest == 16
+
+        # N=1 should pick key=1
+        closest = min(result.keys(), key=lambda x: abs(x - 1))
+        assert closest == 1
+
+        # N=40 should pick key=16 (distance 24) vs key=64 (distance 24)
+        # Tie: min() returns first, which is 16
+        closest = min(result.keys(), key=lambda x: abs(x - 40))
+        assert closest in (16, 64)
+
+    get_mamba_ssm_configs.cache_clear()

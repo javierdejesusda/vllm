@@ -4,13 +4,23 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
 
+import functools
+import json
+import os
+from typing import Any
+
 import torch
 from packaging import version
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
+from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+logger = init_logger(__name__)
 
 TRITON3 = HAS_TRITON and (version.parse(triton.__version__) >= version.parse("3.0.0"))
 
@@ -270,6 +280,58 @@ def _selective_scan_update_kernel(
         tl.store(dst_state_ptrs, state.to(dst_state_ptrs.dtype.element_ty), mask=mask)
 
 
+def get_mamba_config_file_name(dim: int, dstate: int) -> str:
+    device_name = current_platform.get_device_name().replace(" ", "_")
+    if "H200" in device_name.split("_"):
+        device_name = "NVIDIA_H200"
+    return f"dim={dim},dstate={dstate},device_name={device_name}.json"
+
+
+@functools.lru_cache
+def get_mamba_ssm_configs(
+    dim: int, dstate: int
+) -> dict[int, Any] | None:
+    """
+    Return optimized configurations for the Mamba selective_state_update kernel.
+
+    Returns a dict mapping batch sizes to {BLOCK_SIZE_M, num_warps} configs,
+    or None if no tuned config is available.
+    """
+    json_file_name = get_mamba_config_file_name(dim, dstate)
+    config_file_paths = []
+
+    user_defined_config_folder = envs.VLLM_TUNED_CONFIG_FOLDER
+    if user_defined_config_folder is not None:
+        config_file_paths.append(
+            os.path.join(user_defined_config_folder, json_file_name)
+        )
+
+    default_config_file_path = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
+    )
+    config_file_paths.append(default_config_file_path)
+
+    for config_file_path in config_file_paths:
+        if os.path.exists(config_file_path):
+            with open(config_file_path) as f:
+                logger.info_once(
+                    "Using configuration from %s for Mamba SSM layer.",
+                    config_file_path,
+                    scope="global",
+                )
+                tuned_config = json.load(f)
+                tuned_config.pop("triton_version", None)
+                return {int(key): val for key, val in tuned_config.items()}
+
+    logger.warning_once(
+        "Using default Mamba SSM config. Performance might be sub-optimal! "
+        "Config file not found at %s",
+        ", ".join(config_file_paths),
+        scope="local",
+    )
+    return None
+
+
 def selective_state_update(
     state,
     x,
@@ -394,24 +456,26 @@ def selective_state_update(
         else (0, 0)
     )
     # We don't want autotune since it will overwrite the state.
-    # We instead tune by hand based on dstate.
-
-    # Default
-    BLOCK_SIZE_M, num_warps = 4, 8
-
-    if dstate <= 16:
-        BLOCK_SIZE_M, num_warps = 32, 4
-    elif dstate <= 32:
-        BLOCK_SIZE_M, num_warps = 16, 4
-    elif dstate <= 64:
-        BLOCK_SIZE_M, num_warps = 8, 4
+    # Try loading tuned config from file, fall back to hand-tuned defaults.
+    configs = get_mamba_ssm_configs(dim, dstate)
+    if configs is not None:
+        closest_N = min(configs.keys(), key=lambda x: abs(x - N))
+        config = configs[closest_N]
+        BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
+        num_warps = config["num_warps"]
     else:
-        # dstate > 64
-        if is_blackwell:
-            # Optimized for B200 with dstate>64
-            BLOCK_SIZE_M, num_warps = 32, 8
-        elif dstate <= 128:
-            BLOCK_SIZE_M, num_warps = 4, 4
+        BLOCK_SIZE_M, num_warps = 4, 8
+        if dstate <= 16:
+            BLOCK_SIZE_M, num_warps = 32, 4
+        elif dstate <= 32:
+            BLOCK_SIZE_M, num_warps = 16, 4
+        elif dstate <= 64:
+            BLOCK_SIZE_M, num_warps = 8, 4
+        else:
+            if is_blackwell:
+                BLOCK_SIZE_M, num_warps = 32, 8
+            elif dstate <= 128:
+                BLOCK_SIZE_M, num_warps = 4, 4
 
     tie_hdim = (
         A.stride(-1) == 0
